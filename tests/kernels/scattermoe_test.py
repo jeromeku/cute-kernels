@@ -101,8 +101,9 @@ class ScatterMoETest(TestCommons):
             del new_state_dict
 
         moe_torch.load_state_dict(state_dict)
-
-        x_torch = torch.randn(hidden_size, device=device, dtype=dtype, requires_grad=True)
+        bs = 1
+        seqlen = 8192
+        x_torch = torch.randn(bs, seqlen, hidden_size, device=device, dtype=dtype, requires_grad=True)
         x_custom = x_torch.clone().detach().requires_grad_()
 
         y_torch = moe_torch(x_torch)[0]

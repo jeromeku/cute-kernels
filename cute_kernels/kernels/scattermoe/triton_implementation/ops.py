@@ -31,7 +31,7 @@ def expert_boundaries(sorted_experts_idxs: torch.Tensor, k: int) -> torch.Tensor
     return expert_boundaries_end
 
 
-# @cute_op(f"{LIBRARY_NAME}::scatter2scatter", mutates_args={"out"})
+@cute_op(f"{LIBRARY_NAME}::scatter2scatter", mutates_args={"out"})
 def scatter2scatter(
     X: torch.Tensor,
     W: torch.Tensor,

@@ -87,7 +87,7 @@ class MoE_Triton(MoE_Torch):
             expert_offsets = bincount(
                 sorted_expert_idxs, self.num_experts
             ).cumsum(-1)
-
+        breakpoint()
         hidden_states = self.c_fc(
             hidden_states,
             self.top_k,

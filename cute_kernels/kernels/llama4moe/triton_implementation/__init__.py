@@ -81,18 +81,18 @@ class MoE_Triton(MoE_Torch):
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
         with torch.no_grad():
-            sorted_expert_idxs, sorted_scattered_idxs = (
+            sorted_expert_idx, sorted_scattered_idx = (
                 selected_experts.flatten().sort()
             )
             expert_offsets = bincount(
-                sorted_expert_idxs, self.num_experts
+                sorted_expert_idx, self.num_experts
             ).cumsum(-1)
         breakpoint()
         hidden_states = self.c_fc(
             hidden_states,
             self.top_k,
-            sorted_expert_idxs,
-            sorted_scattered_idxs,
+            sorted_expert_idx,
+            sorted_scattered_idx,
             expert_offsets,
             grouped_out=True,
         )
@@ -101,8 +101,8 @@ class MoE_Triton(MoE_Torch):
         hidden_states = self.c_proj(
             hidden_states,
             1, # hardcoded in original code
-            sorted_expert_idxs,
-            sorted_scattered_idxs,
+            sorted_expert_idx,
+            sorted_scattered_idx,
             expert_offsets,
             grouped_in=True,
             gates=router_weights,

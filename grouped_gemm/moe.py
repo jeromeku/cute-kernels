@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 
 class Experts_Torch(nn.Module):
@@ -251,6 +253,17 @@ def test_gather(A, sorted_token_idx, sorted_expert_idx, num_experts) -> None:
         print(f"Expert {e} group size: {group_size}:\nAssigned rows: {assigned_rows}, A_group: {A_group.shape}\n{A_group}")
         group_start = group_end
 
+
+@triton.jit
+def histogram_kernel(x_ptr, z_ptr, M: tl.constexpr, N: tl.constexpr):
+    x_idx = tl.arange(0, M)
+    z_idx = tl.arange(0, N)
+    x = tl.load(x_ptr + x_idx)
+    tl.device_print("x", x)
+    z = tl.histogram(x.to(tl.int32), num_bins=N)
+    tl.device_print("z", z)
+    tl.store(z_ptr + z_idx, z)
+
 if __name__ == "__main__":
     NUM_EXPERTS = 8
     TOPK = 1
@@ -270,4 +283,13 @@ if __name__ == "__main__":
     sorted_expert_idx, sorted_token_idx = test_router(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, NUM_EXPERTS, TOPK)
     print(f"Sorted expert idx: {sorted_expert_idx}")
     print(f"Sorted token idx: {sorted_token_idx}")
-    test_gather(A, sorted_token_idx, sorted_expert_idx, NUM_EXPERTS)
+    # test_gather(A, sorted_token_idx, sorted_expert_idx, NUM_EXPERTS)
+    M = sorted_token_idx.shape[0]
+    N = NUM_EXPERTS
+    z = torch.empty(N, dtype=torch.int32, device=DEVICE)
+    histogram_kernel[(1,)](sorted_expert_idx, z, M, N)
+
+    ref_hist = sorted_expert_idx.bincount(minlength=N)
+    print(f"Z: {z}")
+    print(f"Ref hist: {ref_hist}")
+    assert (z == ref_hist).all(), f"Z != ref_hist: {z} != {ref_hist}"

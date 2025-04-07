@@ -165,10 +165,96 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def test_grouped_gemm_bf16(
+    G: int,
+    M: int,
+    N: int,
+    K: int,
+) -> None:
+    device = torch.device("cuda")
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b = torch.randn(N * G, K, dtype=torch.bfloat16, device=device)
+    m_ends, _ = torch.sort(
+        torch.randint(
+            low=0, high=M, size=[G - 1], device=device, dtype=torch.int32
+        )
+        if M > 0
+        else torch.zeros([G - 1], device=device, dtype=torch.int32)
+    )
+    m_ends = m_ends.tolist()
+    m_starts = [0] + m_ends
+    m_ends = m_ends + [M]
+    m_sizes = torch.tensor(
+        [m_ends[i] - m_starts[i] for i in range(G)], device=device
+    ).to(torch.int32)
+    print(f"M sizes: {m_sizes} {m_sizes.sum().item()}")
+
+def test_router(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    num_experts: int,
+    topk: int,
+    verbose: bool = False,
+) -> None:
+    device = torch.device("cuda")
+    x = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float32, device=device)
+    gate = nn.Linear(hidden_size, num_experts, bias=False).to(device)
+    router_logits = gate(x)
+    router_weights, selected_experts = compute_routing_weights(router_logits, topk)
+    if verbose:
+        print(f"Router_logits: {router_logits.shape}")
+        print(f"Router_weights: {router_weights}")
+        print(f"Selected experts:\n{selected_experts}")
+
+    with torch.no_grad():
+        sorted_expert_idx, sorted_token_idx = selected_experts.flatten().sort()
+        expert_offsets = torch.bincount(sorted_expert_idx, minlength=NUM_EXPERTS)
+        tok_assignment_check = selected_experts.flatten().argsort()
+        assert (tok_assignment_check == sorted_token_idx).all(), f"Tok assignment check != sorted scattered idx: {tok_assignment_check} != {sorted_token_idx}"
+
+    if verbose:
+        print(f"Sorted expert idxs: {sorted_expert_idx}")
+        print(f"Sorted scattered idxs: {sorted_token_idx}")
+        print(f"Expert offsets: {expert_offsets}")
+    start_idx = 0
+    for e in range(NUM_EXPERTS):
+        num_assigned_tokens = expert_offsets[e]
+        expert_assignment = sorted_expert_idx[start_idx:start_idx+num_assigned_tokens]
+        assert (expert_assignment == e).all(), f"Expert {e} assigned {num_assigned_tokens}, sorted expert idx != {e}: {expert_assignment}"
+        token_assignment = sorted_token_idx[start_idx:start_idx+num_assigned_tokens]
+
+        if verbose:
+            print(f"Expert {e} assigned {num_assigned_tokens} tokens: {token_assignment}")
+        
+        start_idx += num_assigned_tokens
+    return sorted_expert_idx, sorted_token_idx
+
+def test_gather(A, sorted_token_idx, sorted_expert_idx, num_experts) -> None:
+    # Group sizes correspond to M in grouped gemm for each expert
+    group_sizes = torch.bincount(sorted_expert_idx, minlength=num_experts)
+
+    assert A.ndim == 2, f"A must be 2D, got {A.ndim}"
+    assert sorted_expert_idx.shape[0] == A.shape[0], f"sorted_expert_idx.shape[0] must match A.shape[0], got {sorted_expert_idx.shape[0]} != {A.shape[0]}"
+    gather_idx = sorted_token_idx.flatten().unsqueeze(-1).expand_as(A)
+
+    print(f"A: \n{A}")
+    group_start = 0
+    for e in range(num_experts):
+        group_size = group_sizes[e]
+        if group_size == 0:
+            continue
+        group_end = group_start + group_size
+        group_row_idx = gather_idx[group_start:group_end]
+        assigned_rows = sorted_token_idx[group_start:group_end]
+        A_group = A.gather(0, group_row_idx)
+        print(f"Expert {e} group size: {group_size}:\nAssigned rows: {assigned_rows}, A_group: {A_group.shape}\n{A_group}")
+        group_start = group_end
+
 if __name__ == "__main__":
     NUM_EXPERTS = 8
     TOPK = 1
-    HIDDEN_SIZE = 5120
+    HIDDEN_SIZE = 4
     INTERMEDIATE_SIZE = 8192
     BATCH_SIZE = 1
     SEQLEN = 16
@@ -178,31 +264,10 @@ if __name__ == "__main__":
 
     set_seed(SEED)
 
-    x = torch.randn(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, dtype=DTYPE, device=DEVICE)
-    gate = nn.Linear(HIDDEN_SIZE, NUM_EXPERTS, bias=False).to(DEVICE)
-    router_logits = gate(x)
-    router_weights, selected_experts = compute_routing_weights(router_logits, TOPK)
-    print(f"Router_logits: {router_logits.shape}")
-    print(f"Router_weights: {router_weights}")
-    print(f"Selected experts:\n{selected_experts}")
-
-    with torch.no_grad():
-        sorted_expert_idx, sorted_scattered_idx = selected_experts.flatten().sort()
-        expert_offsets = torch.bincount(sorted_expert_idx, minlength=NUM_EXPERTS)
-        tok_assignment_check = selected_experts.flatten().argsort()
-        print(f"Tok assignment check: {tok_assignment_check}")
-        assert (tok_assignment_check == sorted_scattered_idx).all(), f"Tok assignment check != sorted scattered idx: {tok_assignment_check} != {sorted_scattered_idx}"
-        
-    print(f"Sorted expert idxs: {sorted_expert_idx}")
-    print(f"Sorted scattered idxs: {sorted_scattered_idx}")
-    print(f"Expert offsets: {expert_offsets}")
-    start_idx = 0
-    for e in range(NUM_EXPERTS):
-        num_assigned_tokens = expert_offsets[e]
-        expert_assignment = sorted_expert_idx[start_idx:start_idx+num_assigned_tokens]
-        assert (expert_assignment == e).all(), f"Expert {e} assigned {num_assigned_tokens}, sorted expert idx != {e}: {expert_assignment}"
-        token_assignment = sorted_scattered_idx[start_idx:start_idx+num_assigned_tokens]
-        print(f"Expert {e} assigned {num_assigned_tokens} tokens: {token_assignment}")
-        
-        start_idx += num_assigned_tokens
-
+    # test_router(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, NUM_EXPERTS, TOPK)
+    # test_grouped_gemm_bf16(G=NUM_EXPERTS, M=BATCH_SIZE * SEQLEN, N=INTERMEDIATE_SIZE, K=HIDDEN_SIZE)
+    A = torch.arange(BATCH_SIZE * SEQLEN * HIDDEN_SIZE, dtype=DTYPE, device=DEVICE).view(BATCH_SIZE * SEQLEN, HIDDEN_SIZE)
+    sorted_expert_idx, sorted_token_idx = test_router(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, NUM_EXPERTS, TOPK)
+    print(f"Sorted expert idx: {sorted_expert_idx}")
+    print(f"Sorted token idx: {sorted_token_idx}")
+    test_gather(A, sorted_token_idx, sorted_expert_idx, NUM_EXPERTS)

@@ -132,42 +132,6 @@ def make_inputs(M, N, K, E, topk, dtype):
     return a, w1, w2, score
 
 
-def test_fused_moe(M, N, K, E, topk, dtype, verbose=False):
-    a, w1, w2, gating_output = make_inputs(M, N, K, E, topk, dtype)
-
-    torch_out, torch_weights, torch_selected_experts = torch_moe(
-        a,
-        w1,
-        w2,
-        gating_output,
-        topk,
-        return_topk_weights=True,
-        return_selected_experts=True,
-    )
-    iterative_out, iterative_weights, iterative_selected_experts = iterative_moe(
-        a,
-        w1,
-        w2,
-        gating_output,
-        topk,
-        global_num_experts=E,
-        renormalize=False,
-        return_topk_weights=True,
-        return_selected_experts=True,
-    )
-    if verbose:
-        print(f"torch_weights: {torch_weights}")
-        print(f"iterative_weights: {iterative_weights}")
-        print(f"torch_selected_experts: {torch_selected_experts}")
-        print(f"iterative_selected_experts: {iterative_selected_experts}")
-    diff = (torch_out - iterative_out).abs().max()
-
-    print(f"Diff: {diff}")
-    assert torch_selected_experts.equal(
-        iterative_selected_experts.view_as(torch_selected_experts)
-    )
-    assert torch_weights.equal(iterative_weights.view_as(torch_weights))
-    assert diff < 1e-5
 
 
 def get_sorted_tokens_by_expert(selected_experts, num_experts):
@@ -254,6 +218,76 @@ def gather_moe(
         else acc
     )
 
+def test_fused_moe(M, N, K, E, topk, dtype, verbose=False, debug=False, test_iterative=False):
+    a, w1, w2, gating_output = make_inputs(M, N, K, E, topk, dtype)
+
+    torch_out = torch_moe(
+        a=a,
+        w1=w1,
+        w2=w2,
+        gating_output=gating_output,
+        topk=topk,
+        return_topk_weights=debug,
+        return_selected_experts=debug,
+    )
+    if debug:
+        torch_out, torch_topk_weights, torch_selected_experts = torch_out
+   
+    gather_out = gather_moe(
+        a=a,
+        w1=w1,
+        w2=w2,
+        gating_output=gating_output,
+        topk=topk,
+        score_func=score_func,
+        debug=debug,
+        renormalize=renormalize,
+    )
+    if debug:
+        gather_out, gather_topk_weights, gather_selected_experts, sorted_expert_idx, sorted_token_idx, token_counts_by_expert = gather_out
+        assert torch_topk_weights.equal(gather_topk_weights.view_as(torch_topk_weights)), f"torch_topk_weights: {torch_topk_weights}\ngather_topk_weights: {gather_topk_weights}"
+        assert torch_selected_experts.equal(gather_selected_experts.view_as(torch_selected_experts)), f"torch_selected_experts: {torch_selected_experts}\ngather_selected_experts: {gather_selected_experts}"
+
+    diff = (torch_out - gather_out).abs().max()
+    print(f"torch vs gather: {diff}")
+    assert diff < 1e-5
+
+    if test_iterative:
+        iterative_out = iterative_moe(
+            a=a,
+            w1=w1,
+            w2=w2,
+            gating_output=gating_output,
+            topk=topk,
+        global_num_experts=E,
+        renormalize=False,
+        return_topk_weights=debug,
+        return_selected_experts=debug,
+    )
+        if debug:
+            iterative_out, iterative_topk_weights, iterative_selected_experts = iterative_out
+        if verbose:
+            print(f"torch_weights: {torch_topk_weights}")
+            print(f"iterative_weights: {iterative_topk_weights}")
+            print(f"torch_selected_experts: {torch_selected_experts}")
+            print(f"iterative_selected_experts: {iterative_selected_experts}")
+        if debug:
+            assert torch_selected_experts.equal(
+                iterative_selected_experts.view_as(torch_selected_experts)
+            )
+            assert torch_topk_weights.equal(iterative_topk_weights.view_as(torch_topk_weights))
+
+        diff = (torch_out - iterative_out).abs().max()
+
+        print(f"torch vs iterative: {diff}")
+        assert diff < 1e-5
+
+def test_bincompile(num_tokens, num_experts):
+    selected_experts = torch.randint(0, num_experts, (num_tokens,), device="cuda")
+    sorted_expert_idx, sorted_token_idx = selected_experts.sort()
+    token_counts_by_expert = torch.bincount(sorted_expert_idx, minlength=num_experts)
+    token_counts_compiled = torch.compile(torch.bincount)(sorted_expert_idx, minlength=num_experts)
+    assert token_counts_compiled.equal(token_counts_by_expert)
 
 if __name__ == "__main__":
     BS = 1
@@ -266,57 +300,8 @@ if __name__ == "__main__":
     DTYPE = torch.float32
     renormalize = False
     score_func = F.sigmoid
-    debug = True
+    debug = False
+    test_iterative = False
     #    test_fused_moe(M, N, K, E, TOPK, DTYPE)
-    A, W1, W2, gating_output = make_inputs(M, N, K, E, TOPK, DTYPE)
-    gather_outputs = gather_moe(
-        a=A,
-        w1=W1,
-        w2=W2,
-        gating_output=gating_output,
-        topk=TOPK,
-        score_func=score_func,
-        debug=debug,
-        renormalize=renormalize,
-    )
-    if debug:
-        (
-            gather_out,
-            gather_topk_weights,
-            gather_selected_experts,
-            sorted_expert_idx,
-            sorted_token_idx,
-            token_counts_by_expert,
-        ) = gather_outputs
-    
-    torch_out, torch_topk_weights, torch_selected_experts = torch_moe(
-        a=A,
-        w1=W1,
-        w2=W2,
-        gating_output=gating_output,
-        topk=TOPK,
-        score_func=score_func,
-        renormalize=renormalize,
-        return_topk_weights=debug,
-        return_selected_experts=debug,
-    )
-    if debug:
-        assert torch_topk_weights.equal(
-            gather_topk_weights.view_as(torch_topk_weights)
-        ), (
-            f"torch_topk_weights: {torch_topk_weights}\ngather_topk_weights: {gather_topk_weights}"
-        )
-        assert torch_selected_experts.equal(
-            gather_selected_experts.view_as(torch_selected_experts)
-        ), (
-            f"torch_selected_experts: {torch_selected_experts}\ngather_selected_experts: {gather_selected_experts}"
-        )
-    
-    assert torch_out.shape == gather_out.shape, (
-        f"torch_out: {torch_out.shape}\ngather_out: {gather_out.shape}"
-    )
-    assert torch_out.dtype == gather_out.dtype, (
-        f"torch_out: {torch_out.dtype}\ngather_out: {gather_out.dtype}"
-    )
-    diff = (torch_out - gather_out).abs().max()
-    print(f"Diff: {diff}")
+  #  A, W1, W2, gating_output = make_inputs(M, N, K, E, TOPK, DTYPE)
+    test_fused_moe(M, N, K, E, TOPK, DTYPE, debug=debug, test_iterative=test_iterative)

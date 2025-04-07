@@ -39,9 +39,9 @@ class MoE_Triton(MoE_Torch):
         num_experts_per_tok: int,
         hidden_size: int,
         intermediate_size: int,
-        activation_function: Callable,
         add_bias: bool,
         std: float,
+        activation_function: Callable = F.silu,
     ) -> None:
         nn.Module.__init__(self)
 
@@ -97,10 +97,10 @@ class MoE_Triton(MoE_Torch):
             grouped_out=True,
         )
         gate, up = hidden_states.chunk(2, dim=-1)
-        hidden_states = F.silu(gate) * up
+        hidden_states = self.act(gate) * up
         hidden_states = self.c_proj(
             hidden_states,
-            1,
+            1, # hardcoded in original code
             sorted_expert_idxs,
             sorted_scattered_idxs,
             expert_offsets,

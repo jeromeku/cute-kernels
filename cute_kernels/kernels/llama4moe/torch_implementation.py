@@ -7,11 +7,18 @@ import torch.nn.functional as F
 
 class Experts_Torch(nn.Module):
     def __init__(
-        self, num_experts: int, in_features: int, out_features: int, add_bias: bool = True, std: float | None = None
+        self,
+        num_experts: int,
+        in_features: int,
+        out_features: int,
+        add_bias: bool = True,
+        std: float | None = None,
     ) -> None:
         super().__init__()
 
-        self.weight = nn.Parameter(torch.empty(num_experts, out_features, in_features))
+        self.weight = nn.Parameter(
+            torch.empty(num_experts, out_features, in_features)
+        )
 
         self.bias = None
         if add_bias:
@@ -35,7 +42,11 @@ class Experts_Torch(nn.Module):
             input = input.split(expert_frequency.tolist(), dim=0)
 
         input = [
-            F.linear(input[i], self.weight[i], None if self.bias is None else self.bias[i])
+            F.linear(
+                input[i],
+                self.weight[i],
+                None if self.bias is None else self.bias[i],
+            )
             for i in range(self.num_experts)
         ]
 
@@ -63,10 +74,9 @@ class MoE_Torch(nn.Module):
         num_experts_per_tok: int,
         hidden_size: int,
         intermediate_size: int,
-        activation_function: Callable,
-        is_glu: bool,
         add_bias: bool,
         std: float,
+        activation_function: Callable = F.silu,
     ) -> None:
         super().__init__()
 
@@ -76,12 +86,14 @@ class MoE_Torch(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
 
-        self.gate = nn.Linear(in_features=self.hidden_size, out_features=num_experts, bias=False)
+        self.gate = nn.Linear(
+            in_features=self.hidden_size, out_features=num_experts, bias=False
+        )
 
         self.c_fc = Experts_Torch(
             num_experts=num_experts,
             in_features=self.hidden_size,
-            out_features=2 * self.intermediate_size if is_glu else self.intermediate_size,
+            out_features=2 * self.intermediate_size,
             add_bias=add_bias,
             std=std,
         )
@@ -102,20 +114,26 @@ class MoE_Torch(nn.Module):
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # hidden_states -> (total_q, hidden_size)
-        router_logits, router_weights, selected_experts = self._compute_routing_weights(hidden_states)
+        router_logits, router_weights, selected_experts = (
+            self._compute_routing_weights(hidden_states)
+        )
 
         # router_logits -> (total_q, num_experts)
         # router_weights -> (total_q, top_k)
         # selected_experts -> (total_q, top_k)
 
-        hidden_states = self._compute_experts(hidden_states, router_weights, selected_experts)
+        hidden_states = self._compute_experts(
+            hidden_states, router_weights, selected_experts
+        )
         hidden_states = hidden_states.view(original_shape)
 
         # hidden_states -> (batch_size, query_length, hidden_size)
 
         return hidden_states, router_logits
 
-    def _compute_routing_weights(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor]:
+    def _compute_routing_weights(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor]:
         # hidden_states -> (total_q, hidden_size)
         router_logits = self.gate(hidden_states)
         # router_logits -> (total_q, num_experts)
@@ -131,7 +149,10 @@ class MoE_Torch(nn.Module):
         return router_logits, router_weights, selected_experts
 
     def _compute_experts(
-        self, hidden_states: torch.Tensor, router_weights: torch.Tensor, selected_experts: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
     ) -> torch.Tensor:
         total_q = hidden_states.shape[0]
 
@@ -139,7 +160,9 @@ class MoE_Torch(nn.Module):
         # router_weights -> (total_q, top_k)
         # selected_experts -> (total_q, top_k)
 
-        fan_in_index, batch_gates, expert_frequency = self._compute_expert_assignment(router_weights, selected_experts)
+        fan_in_index, batch_gates, expert_frequency = (
+            self._compute_expert_assignment(router_weights, selected_experts)
+        )
 
         # fan_in_index -> (total_q * top_k)
         # batch_gates -> (total_q * top_k)
@@ -149,15 +172,25 @@ class MoE_Torch(nn.Module):
 
         # hidden_states -> (total_q * top_k, hidden_size)
 
-        hidden_states = self.c_fc(hidden_states, expert_frequency, return_list=True)
-        # hidden_states -> num_experts x (?, hidden_size)
-        hidden_states = [self.act(i) for i in hidden_states]
+        hidden_states = self.c_fc(
+            hidden_states, expert_frequency, return_list=True
+        )
+        gate, up = hidden_states.chunk(2, dim=-1)
+        hidden_states = self.act(gate) * up
+        # # hidden_states -> num_experts x (?, hidden_size)
+        # hidden_states = [self.act(i) for i in hidden_states]
         # hidden_states -> num_experts x (?, intermediate_size)
-        hidden_states = self.c_proj(hidden_states, expert_frequency, return_list=False)
+        hidden_states = self.c_proj(
+            hidden_states, expert_frequency, return_list=False
+        )
         # hidden_states -> (total_q * top_k, hidden_size)
 
         hidden_states = hidden_states * batch_gates.unsqueeze(-1)
-        zeros = torch.zeros((total_q, self.hidden_size), dtype=hidden_states.dtype, device=hidden_states.device)
+        zeros = torch.zeros(
+            (total_q, self.hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
         hidden_states = zeros.index_add(0, fan_in_index, hidden_states)
 
         # hidden_states -> (total_q, hidden_size)

@@ -3,6 +3,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from ..torch_implementation import Experts_Torch, MoE_Torch
 from .ops import bincount, scattered_experts
 
@@ -58,7 +59,7 @@ class MoE_Triton(MoE_Torch):
         self.c_fc = Experts_Triton(
             num_experts=num_experts,
             in_features=self.hidden_size,
-            out_features=2 * self.intermediate_size
+            out_features=2 * self.intermediate_size,
             add_bias=add_bias,
             std=std,
         )

@@ -173,7 +173,7 @@ class MoE_Torch(nn.Module):
         # hidden_states -> (total_q * top_k, hidden_size)
 
         hidden_states = self.c_fc(
-            hidden_states, expert_frequency, return_list=True
+            hidden_states, expert_frequency, return_list=False
         )
         gate, up = hidden_states.chunk(2, dim=-1)
         hidden_states = self.act(gate) * up

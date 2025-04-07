@@ -9,6 +9,14 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x[..., :d]) * x[..., d:]
 
 
+def make_inputs(M, N, K, E, topk, dtype):
+    a = torch.randn((M, K), device="cuda", dtype=dtype) / 10
+    w1 = torch.randn((E, 2 * N, K), device="cuda", dtype=dtype) / 10
+    w2 = torch.randn((E, K, N), device="cuda", dtype=dtype) / 10
+    score = torch.randn((M, E), device="cuda", dtype=dtype)
+    return a, w1, w2, score
+
+
 def calculate_topk(gating_output, topk, score_func=F.sigmoid, renormalize=False):
     if score_func == F.sigmoid:
         kwargs = {}
@@ -124,16 +132,6 @@ def iterative_moe(
     return tuple(outputs) if len(outputs) > 1 else outputs[0]
 
 
-def make_inputs(M, N, K, E, topk, dtype):
-    a = torch.randn((M, K), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((E, 2 * N, K), device="cuda", dtype=dtype) / 10
-    w2 = torch.randn((E, K, N), device="cuda", dtype=dtype) / 10
-    score = torch.randn((M, E), device="cuda", dtype=dtype)
-    return a, w1, w2, score
-
-
-
-
 def get_sorted_tokens_by_expert(selected_experts, num_experts):
     """
     sorted_expert_idx: [num_tokens] needed to calculate tokens per expert -- see torchtitan for alternative impl that does not require bincount
@@ -218,7 +216,10 @@ def gather_moe(
         else acc
     )
 
-def test_fused_moe(M, N, K, E, topk, dtype, verbose=False, debug=False, test_iterative=False):
+
+def test_fused_moe(
+    M, N, K, E, topk, dtype, verbose=False, debug=False, test_iterative=False
+):
     a, w1, w2, gating_output = make_inputs(M, N, K, E, topk, dtype)
 
     torch_out = torch_moe(
@@ -232,7 +233,7 @@ def test_fused_moe(M, N, K, E, topk, dtype, verbose=False, debug=False, test_ite
     )
     if debug:
         torch_out, torch_topk_weights, torch_selected_experts = torch_out
-   
+
     gather_out = gather_moe(
         a=a,
         w1=w1,
@@ -244,9 +245,24 @@ def test_fused_moe(M, N, K, E, topk, dtype, verbose=False, debug=False, test_ite
         renormalize=renormalize,
     )
     if debug:
-        gather_out, gather_topk_weights, gather_selected_experts, sorted_expert_idx, sorted_token_idx, token_counts_by_expert = gather_out
-        assert torch_topk_weights.equal(gather_topk_weights.view_as(torch_topk_weights)), f"torch_topk_weights: {torch_topk_weights}\ngather_topk_weights: {gather_topk_weights}"
-        assert torch_selected_experts.equal(gather_selected_experts.view_as(torch_selected_experts)), f"torch_selected_experts: {torch_selected_experts}\ngather_selected_experts: {gather_selected_experts}"
+        (
+            gather_out,
+            gather_topk_weights,
+            gather_selected_experts,
+            sorted_expert_idx,
+            sorted_token_idx,
+            token_counts_by_expert,
+        ) = gather_out
+        assert torch_topk_weights.equal(
+            gather_topk_weights.view_as(torch_topk_weights)
+        ), (
+            f"torch_topk_weights: {torch_topk_weights}\ngather_topk_weights: {gather_topk_weights}"
+        )
+        assert torch_selected_experts.equal(
+            gather_selected_experts.view_as(torch_selected_experts)
+        ), (
+            f"torch_selected_experts: {torch_selected_experts}\ngather_selected_experts: {gather_selected_experts}"
+        )
 
     diff = (torch_out - gather_out).abs().max()
     print(f"torch vs gather: {diff}")
@@ -259,13 +275,15 @@ def test_fused_moe(M, N, K, E, topk, dtype, verbose=False, debug=False, test_ite
             w2=w2,
             gating_output=gating_output,
             topk=topk,
-        global_num_experts=E,
-        renormalize=False,
-        return_topk_weights=debug,
-        return_selected_experts=debug,
-    )
+            global_num_experts=E,
+            renormalize=False,
+            return_topk_weights=debug,
+            return_selected_experts=debug,
+        )
         if debug:
-            iterative_out, iterative_topk_weights, iterative_selected_experts = iterative_out
+            iterative_out, iterative_topk_weights, iterative_selected_experts = (
+                iterative_out
+            )
         if verbose:
             print(f"torch_weights: {torch_topk_weights}")
             print(f"iterative_weights: {iterative_topk_weights}")
@@ -275,19 +293,48 @@ def test_fused_moe(M, N, K, E, topk, dtype, verbose=False, debug=False, test_ite
             assert torch_selected_experts.equal(
                 iterative_selected_experts.view_as(torch_selected_experts)
             )
-            assert torch_topk_weights.equal(iterative_topk_weights.view_as(torch_topk_weights))
+            assert torch_topk_weights.equal(
+                iterative_topk_weights.view_as(torch_topk_weights)
+            )
 
         diff = (torch_out - iterative_out).abs().max()
 
         print(f"torch vs iterative: {diff}")
         assert diff < 1e-5
 
+
 def test_bincompile(num_tokens, num_experts):
     selected_experts = torch.randint(0, num_experts, (num_tokens,), device="cuda")
     sorted_expert_idx, sorted_token_idx = selected_experts.sort()
     token_counts_by_expert = torch.bincount(sorted_expert_idx, minlength=num_experts)
-    token_counts_compiled = torch.compile(torch.bincount)(sorted_expert_idx, minlength=num_experts)
+    token_counts_compiled = torch.compile(torch.bincount)(
+        sorted_expert_idx, minlength=num_experts
+    )
     assert token_counts_compiled.equal(token_counts_by_expert)
+
+
+def get_grouped_gemm_inputs(gating_output, topk, num_experts, use_bincount=True):
+    topk_weights, topk_ids = calculate_topk(
+        gating_output, topk, score_func=score_func, renormalize=renormalize
+    )
+    topk_weights = topk_weights.view(-1)  # num_tokens * topk
+    topk_ids = topk_ids.view(-1)  # num_tokens * topk
+    
+    num_tokens = topk_ids.shape[0]
+    # Alternative to bincount
+    
+    if use_bincount:
+        # 1. Sort token assignments by expert
+        sorted_expert_idx, sorted_token_idx, token_counts_by_expert = (
+            get_sorted_tokens_by_expert(topk_ids, num_experts=E)
+        )
+        return topk_weights, topk_ids, sorted_expert_idx, sorted_token_idx, token_counts_by_expert
+
+    else:
+        counts = topk_ids.new_zeros((num_tokens, num_experts))
+        counts.scatter_(1, topk_ids.unsqueeze(-1), 1)
+        token_counts_by_expert_no_bincount = counts.sum(dim=0)
+        return topk_weights, topk_ids, token_counts_by_expert_no_bincount
 
 if __name__ == "__main__":
     BS = 1
@@ -302,6 +349,10 @@ if __name__ == "__main__":
     score_func = F.sigmoid
     debug = False
     test_iterative = False
-    #    test_fused_moe(M, N, K, E, TOPK, DTYPE)
-  #  A, W1, W2, gating_output = make_inputs(M, N, K, E, TOPK, DTYPE)
-    test_fused_moe(M, N, K, E, TOPK, DTYPE, debug=debug, test_iterative=test_iterative)
+    #    test_fused_moe(M, N, K, E, TOPK, DTYPE, debug=debug, test_iterative=test_iterative)
+    a, w1, w2, gating_output = make_inputs(M, N, K, E, TOPK, DTYPE)
+    _, _, token_counts_by_expert_no_bincount = get_grouped_gemm_inputs(gating_output, topk=TOPK, num_experts=E, use_bincount=False)
+    #torch._dynamo.config.capture_dynamic_output_shape_ops = True
+    *_, token_counts_by_expert_compiled = torch.compile(get_grouped_gemm_inputs, fullgraph=True)(gating_output, TOPK, E, use_bincount=False)
+    assert token_counts_by_expert_no_bincount.equal(token_counts_by_expert_compiled)
+    

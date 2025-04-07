@@ -80,7 +80,6 @@ class MoE_Triton(MoE_Torch):
         router_weights: torch.Tensor,
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
-        breakpoint()
         with torch.no_grad():
             sorted_expert_idxs, sorted_scattered_idxs = (
                 selected_experts.flatten().sort()

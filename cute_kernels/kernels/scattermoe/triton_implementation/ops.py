@@ -5,8 +5,11 @@ import triton.language as tl
 from ....constants import LIBRARY_NAME
 from ....math import ceil_divide
 from ....utils import cute_op
-from .kernels import group_triton_kernel, groupXtY_triton_kernel, scatter2scatter_triton_kernel
-
+from .kernels import (
+    group_triton_kernel,
+    groupXtY_triton_kernel,
+    scatter2scatter_triton_kernel,
+)
 
 BLOCK_M = 128
 torch._dynamo.config.capture_scalar_outputs = True
@@ -28,7 +31,7 @@ def expert_boundaries(sorted_experts_idxs: torch.Tensor, k: int) -> torch.Tensor
     return expert_boundaries_end
 
 
-@cute_op(f"{LIBRARY_NAME}::scatter2scatter", mutates_args={"out"})
+# @cute_op(f"{LIBRARY_NAME}::scatter2scatter", mutates_args={"out"})
 def scatter2scatter(
     X: torch.Tensor,
     W: torch.Tensor,

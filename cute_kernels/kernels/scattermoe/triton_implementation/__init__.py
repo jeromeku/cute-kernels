@@ -75,7 +75,6 @@ class MoE_Triton(MoE_Torch):
     def _compute_experts(
         self, hidden_states: torch.Tensor, router_weights: torch.Tensor, selected_experts: torch.Tensor
     ) -> torch.Tensor:
-        breakpoint()
         with torch.no_grad():
             sorted_expert_idxs, sorted_scattered_idxs = selected_experts.flatten().sort()
             expert_offsets = bincount(sorted_expert_idxs, self.num_experts).cumsum(-1)

@@ -98,7 +98,6 @@ class MoE_Torch(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
-        breakpoint()
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # hidden_states -> (total_q, hidden_size)

@@ -18,7 +18,7 @@ class ScatterMoETest(TestCommons):
             [5120],  # hidden_size
             [8192],  # intermediate_size
             [True],  # is_glu
-            [False],  # is_compiling
+            [True],  # is_compiling
         )
     )
     def test_scattermoe_triton(

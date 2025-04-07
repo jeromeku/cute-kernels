@@ -166,12 +166,12 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 if __name__ == "__main__":
-    NUM_EXPERTS = 16
+    NUM_EXPERTS = 8
     TOPK = 1
     HIDDEN_SIZE = 5120
     INTERMEDIATE_SIZE = 8192
     BATCH_SIZE = 1
-    SEQLEN = 128
+    SEQLEN = 16
     DTYPE = torch.float32
     DEVICE = "cuda"
     SEED = 42
@@ -182,6 +182,27 @@ if __name__ == "__main__":
     gate = nn.Linear(HIDDEN_SIZE, NUM_EXPERTS, bias=False).to(DEVICE)
     router_logits = gate(x)
     router_weights, selected_experts = compute_routing_weights(router_logits, TOPK)
-    print(router_logits.shape)
-    print(router_weights.shape)
-    print(selected_experts.shape)
+    print(f"Router_logits: {router_logits.shape}")
+    print(f"Router_weights: {router_weights}")
+    print(f"Selected experts:\n{selected_experts}")
+
+    with torch.no_grad():
+        sorted_expert_idx, sorted_scattered_idx = selected_experts.flatten().sort()
+        expert_offsets = torch.bincount(sorted_expert_idx, minlength=NUM_EXPERTS)
+        tok_assignment_check = selected_experts.flatten().argsort()
+        print(f"Tok assignment check: {tok_assignment_check}")
+        assert (tok_assignment_check == sorted_scattered_idx).all(), f"Tok assignment check != sorted scattered idx: {tok_assignment_check} != {sorted_scattered_idx}"
+        
+    print(f"Sorted expert idxs: {sorted_expert_idx}")
+    print(f"Sorted scattered idxs: {sorted_scattered_idx}")
+    print(f"Expert offsets: {expert_offsets}")
+    start_idx = 0
+    for e in range(NUM_EXPERTS):
+        num_assigned_tokens = expert_offsets[e]
+        expert_assignment = sorted_expert_idx[start_idx:start_idx+num_assigned_tokens]
+        assert (expert_assignment == e).all(), f"Expert {e} assigned {num_assigned_tokens}, sorted expert idx != {e}: {expert_assignment}"
+        token_assignment = sorted_scattered_idx[start_idx:start_idx+num_assigned_tokens]
+        print(f"Expert {e} assigned {num_assigned_tokens} tokens: {token_assignment}")
+        
+        start_idx += num_assigned_tokens
+

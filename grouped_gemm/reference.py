@@ -16,15 +16,17 @@ def calculate_topk(gating_output, topk, score_func=F.sigmoid, renormalize=False)
         kwargs = {"dim": -1, "dtype": torch.float32}
     else:
         raise ValueError(f"Unsupported score function: {score_func}")
-    topk_weight = score_func(gating_output, **kwargs)
-    topk_weight, topk_ids = torch.topk(topk_weight, topk)
+    topk_weights = score_func(gating_output, **kwargs)
+    topk_weights, topk_ids = torch.topk(topk_weights, topk)
     if renormalize:
-        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
-    topk_weight = topk_weight.to(gating_output.dtype)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = topk_weights.to(gating_output.dtype)
 
-    return topk_weight, topk_ids
+    return topk_weights, topk_ids
+
 
 def torch_moe(
+    *,
     a,
     w1,
     w2,
@@ -39,7 +41,9 @@ def torch_moe(
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
 
-    topk_weight, topk_ids = calculate_topk(gating_output, topk, score_func, renormalize)
+    topk_weight, topk_ids = calculate_topk(
+        gating_output, topk, score_func=score_func, renormalize=renormalize
+    )
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
 
@@ -62,6 +66,7 @@ def torch_moe(
 
 
 def iterative_moe(
+    *,
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -92,7 +97,7 @@ def iterative_moe(
     gating_output = gating_output.view(num_tokens, global_num_experts)
 
     topk_weights, topk_ids = calculate_topk(
-        gating_output, topk, score_func, renormalize
+        gating_output, topk, score_func=score_func, renormalize=renormalize
     )
     final_hidden_states = None
 
@@ -125,13 +130,19 @@ def make_inputs(M, N, K, E, topk, dtype):
     w2 = torch.randn((E, K, N), device="cuda", dtype=dtype) / 10
     score = torch.randn((M, E), device="cuda", dtype=dtype)
     return a, w1, w2, score
-    
+
 
 def test_fused_moe(M, N, K, E, topk, dtype, verbose=False):
     a, w1, w2, gating_output = make_inputs(M, N, K, E, topk, dtype)
 
     torch_out, torch_weights, torch_selected_experts = torch_moe(
-        a, w1, w2, gating_output, topk, return_topk_weights=True, return_selected_experts=True
+        a,
+        w1,
+        w2,
+        gating_output,
+        topk,
+        return_topk_weights=True,
+        return_selected_experts=True,
     )
     iterative_out, iterative_weights, iterative_selected_experts = iterative_moe(
         a,
@@ -159,7 +170,6 @@ def test_fused_moe(M, N, K, E, topk, dtype, verbose=False):
     assert diff < 1e-5
 
 
-
 def get_sorted_tokens_by_expert(selected_experts, num_experts):
     """
     sorted_expert_idx: [num_tokens] needed to calculate tokens per expert -- see torchtitan for alternative impl that does not require bincount
@@ -168,10 +178,14 @@ def get_sorted_tokens_by_expert(selected_experts, num_experts):
     """
     with torch.no_grad():
         sorted_expert_idx, sorted_token_idx = selected_experts.flatten().sort()
-        token_counts_by_expert = torch.bincount(sorted_expert_idx, minlength=num_experts)
+        token_counts_by_expert = torch.bincount(
+            sorted_expert_idx, minlength=num_experts
+        )
         return sorted_expert_idx, sorted_token_idx, token_counts_by_expert
 
+
 def gather_moe(
+    *,
     a,
     w1,
     w2,
@@ -179,23 +193,67 @@ def gather_moe(
     topk,
     renormalize=False,
     score_func=F.sigmoid,
-    return_topk_weights=False,
-    return_selected_experts=False,
+    debug=False,
     verbose=False,
 ):
     a = a.view(-1, a.shape[-1])
-    B, K = a.shape # B = num_tokens, K = hidden_size
-    E, K, N = w2.shape # E = num_experts, K = hidden_size, N = intermediate_size
+    B, K = a.shape  # B = num_tokens, K = hidden_size
+    E, K, N = w2.shape  # E = num_experts, K = hidden_size, N = intermediate_size
     assert w1.shape == (E, 2 * N, K)
-
-    topk_weight, topk_ids = calculate_topk(gating_output, topk, score_func, renormalize)
-    topk_weight = topk_weight.view(-1) # num_tokens * topk
-    topk_ids = topk_ids.view(-1) # num_tokens * topk
+    topk_weights, topk_ids = calculate_topk(
+        gating_output, topk, score_func=score_func, renormalize=renormalize
+    )
+    topk_weights = topk_weights.view(-1)  # num_tokens * topk
+    topk_ids = topk_ids.view(-1)  # num_tokens * topk
 
     # 1. Sort token assignments by expert
-    sorted_expert_idx, sorted_token_idx, token_counts_by_expert = get_sorted_tokens_by_expert(topk_ids, num_experts=E)
+    sorted_expert_idx, sorted_token_idx, token_counts_by_expert = (
+        get_sorted_tokens_by_expert(topk_ids, num_experts=E)
+    )
+
+    # Simulate grouped gemm by running num_expert gemms
+    # The size of each gemm is M_size x K x N where M_size is the number of tokens assigned to expert e
+    acc = torch.zeros((B, K), device=a.device, dtype=a.dtype)
+
+    token_start = 0
     for e in range(E):
-        assert (sorted_expert_idx == e).sum() == token_counts_by_expert[e], f"Expert {e} has {token_counts_by_expert[e]} tokens, but {sorted_expert_idx.shape[0]} tokens are assigned to expert {e}"
+        M_size = token_counts_by_expert[e]
+        if M_size == 0:
+            continue
+        token_end = token_start + M_size
+        assert (sorted_expert_idx == e).sum() == M_size, (
+            f"Expert {e} has {token_counts_by_expert[e]} tokens, but {sorted_expert_idx.shape[0]} tokens are assigned to expert {e}"
+        )
+
+        token_idx = sorted_token_idx[token_start:token_end]
+        A_ = a[token_idx]  # [M_size, K] -> select tokens assigned to expert e
+        W1_ = w1[e]  # [2 * N, K] -> select expert e
+        W2_ = w2[e]  # [K, N] -> select expert e
+        # Accumulate does not apply for topk == 1
+        intermediate_out = silu_and_mul(A_ @ W1_.transpose(0, 1))  # [M_size, N]
+        assert intermediate_out.shape == (M_size, N)
+        out = intermediate_out @ W2_.transpose(0, 1)  # [M_size, K]
+        assert out.shape == (M_size, K)
+        # Apply topk weights, make sure to broadcast to the correct shape
+        out = out * topk_weights[token_idx, None]
+        assert out.shape == (M_size, K)
+        # Accumulate
+        acc[token_idx] += out
+        token_start = token_end
+
+    return (
+        (
+            acc,
+            topk_weights,
+            topk_ids,
+            sorted_expert_idx,
+            sorted_token_idx,
+            token_counts_by_expert,
+        )
+        if debug
+        else acc
+    )
+
 
 if __name__ == "__main__":
     BS = 1
@@ -206,7 +264,59 @@ if __name__ == "__main__":
     E = 4  # num_experts
     TOPK = 1
     DTYPE = torch.float32
-#    test_fused_moe(M, N, K, E, TOPK, DTYPE)
+    renormalize = False
+    score_func = F.sigmoid
+    debug = True
+    #    test_fused_moe(M, N, K, E, TOPK, DTYPE)
     A, W1, W2, gating_output = make_inputs(M, N, K, E, TOPK, DTYPE)
-    gather_moe(A, W1, W2, gating_output, TOPK, E, verbose=True)
-#    gather_moe(M, N, K, E, TOPK, DTYPE)
+    gather_outputs = gather_moe(
+        a=A,
+        w1=W1,
+        w2=W2,
+        gating_output=gating_output,
+        topk=TOPK,
+        score_func=score_func,
+        debug=debug,
+        renormalize=renormalize,
+    )
+    if debug:
+        (
+            gather_out,
+            gather_topk_weights,
+            gather_selected_experts,
+            sorted_expert_idx,
+            sorted_token_idx,
+            token_counts_by_expert,
+        ) = gather_outputs
+    
+    torch_out, torch_topk_weights, torch_selected_experts = torch_moe(
+        a=A,
+        w1=W1,
+        w2=W2,
+        gating_output=gating_output,
+        topk=TOPK,
+        score_func=score_func,
+        renormalize=renormalize,
+        return_topk_weights=debug,
+        return_selected_experts=debug,
+    )
+    if debug:
+        assert torch_topk_weights.equal(
+            gather_topk_weights.view_as(torch_topk_weights)
+        ), (
+            f"torch_topk_weights: {torch_topk_weights}\ngather_topk_weights: {gather_topk_weights}"
+        )
+        assert torch_selected_experts.equal(
+            gather_selected_experts.view_as(torch_selected_experts)
+        ), (
+            f"torch_selected_experts: {torch_selected_experts}\ngather_selected_experts: {gather_selected_experts}"
+        )
+    
+    assert torch_out.shape == gather_out.shape, (
+        f"torch_out: {torch_out.shape}\ngather_out: {gather_out.shape}"
+    )
+    assert torch_out.dtype == gather_out.dtype, (
+        f"torch_out: {torch_out.dtype}\ngather_out: {gather_out.dtype}"
+    )
+    diff = (torch_out - gather_out).abs().max()
+    print(f"Diff: {diff}")

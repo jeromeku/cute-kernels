@@ -198,6 +198,9 @@ def test_router(
     num_experts: int,
     topk: int,
     verbose: bool = False,
+    return_router_logits: bool = False,
+    return_router_weights: bool = False,
+    return_selected_experts: bool = False,
 ) -> None:
     device = torch.device("cuda")
     x = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float32, device=device)
@@ -230,7 +233,14 @@ def test_router(
             print(f"Expert {e} assigned {num_assigned_tokens} tokens: {token_assignment}")
         
         start_idx += num_assigned_tokens
-    return sorted_expert_idx, sorted_token_idx
+    outputs = [sorted_expert_idx, sorted_token_idx]
+    if return_router_logits:
+        outputs.append(router_logits)
+    if return_router_weights:
+        outputs.append(router_weights)
+    if return_selected_experts:
+        outputs.append(selected_experts)
+    return outputs
 
 def test_gather(A, sorted_token_idx, sorted_expert_idx, num_experts) -> None:
     # Group sizes correspond to M in grouped gemm for each expert
@@ -280,16 +290,22 @@ if __name__ == "__main__":
     # test_router(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, NUM_EXPERTS, TOPK)
     # test_grouped_gemm_bf16(G=NUM_EXPERTS, M=BATCH_SIZE * SEQLEN, N=INTERMEDIATE_SIZE, K=HIDDEN_SIZE)
     A = torch.arange(BATCH_SIZE * SEQLEN * HIDDEN_SIZE, dtype=DTYPE, device=DEVICE).view(BATCH_SIZE * SEQLEN, HIDDEN_SIZE)
-    sorted_expert_idx, sorted_token_idx = test_router(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, NUM_EXPERTS, TOPK)
+    outputs = test_router(BATCH_SIZE, SEQLEN, HIDDEN_SIZE, NUM_EXPERTS, TOPK, return_router_weights=True, return_selected_experts=True, return_router_logits=True)
+    sorted_expert_idx, sorted_token_idx, router_logits, router_weights, selected_experts = outputs
     print(f"Sorted expert idx: {sorted_expert_idx}")
     print(f"Sorted token idx: {sorted_token_idx}")
-    # test_gather(A, sorted_token_idx, sorted_expert_idx, NUM_EXPERTS)
-    M = sorted_token_idx.shape[0]
-    N = NUM_EXPERTS
-    z = torch.empty(N, dtype=torch.int32, device=DEVICE)
-    histogram_kernel[(1,)](sorted_expert_idx, z, M, N)
+    print(f"Router weights: {router_weights}")
+    print(f"Selected experts: {selected_experts}")
+    print(f"Router logits: {router_logits}")
+    breakpoint()
+    
+    # # test_gather(A, sorted_token_idx, sorted_expert_idx, NUM_EXPERTS)
+    # M = sorted_token_idx.shape[0]
+    # N = NUM_EXPERTS
+    # z = torch.empty(N, dtype=torch.int32, device=DEVICE)
+    # histogram_kernel[(1,)](sorted_expert_idx, z, M, N)
 
-    ref_hist = sorted_expert_idx.bincount(minlength=N)
-    print(f"Z: {z}")
-    print(f"Ref hist: {ref_hist}")
-    assert (z == ref_hist).all(), f"Z != ref_hist: {z} != {ref_hist}"
+    # ref_hist = sorted_expert_idx.bincount(minlength=N)
+    # print(f"Z: {z}")
+    # print(f"Ref hist: {ref_hist}")
+    # assert (z == ref_hist).all(), f"Z != ref_hist: {z} != {ref_hist}"
